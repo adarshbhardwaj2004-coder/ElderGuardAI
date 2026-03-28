@@ -25,9 +25,15 @@ from datetime import datetime
 from PIL import Image
 from loguru import logger
 
-# MediaPipe import with fallback
+# MediaPipe import with robust fallback
 try:
     import mediapipe as mp
+    try:
+        from mediapipe.python.solutions import pose as mp_pose
+        mp_solutions = mp.solutions
+    except (ImportError, AttributeError):
+        import mediapipe.python.solutions as mp_solutions
+        from mediapipe.python.solutions import pose as mp_pose
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
@@ -56,7 +62,7 @@ class FallDetector:
         self.is_available = MEDIAPIPE_AVAILABLE
         
         if self.is_available:
-            self.mp_pose = mp.solutions.pose
+            self.mp_pose = mp_solutions.pose
             self.pose = self.mp_pose.Pose(
                 static_image_mode=True,
                 model_complexity=1,

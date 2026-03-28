@@ -22,9 +22,11 @@ export function initializeFirebase(): admin.app.App {
     const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
 
     if (privateKey) {
-        logger.info(`🔍 Firebase Key Check: Starts with ${privateKey.substring(0, 30)}... (Length: ${privateKey.length})`);
+        console.log(`🔍 Firebase Key Check: Starts with ${privateKey.substring(0, 30)}... (Length: ${privateKey.length})`);
+        console.log(`🔍 Private Key [RAW FIRST 50]: |${privateKey.substring(0, 50)}|`);
+        console.log(`🔍 Private Key [RAW LAST 50]: |${privateKey.substring(privateKey.length - 50)}|`);
     } else {
-        logger.warn('❌ Firebase Private Key is MISSING from environment variables');
+        console.warn('❌ Firebase Private Key is MISSING from environment variables');
     }
 
     const isDev = process.env.NODE_ENV === 'development' || !process.env.NODE_ENV;
