@@ -1,24 +1,71 @@
 import cv2
 import numpy as np
-import mediapipe as mp
 import base64
 from datetime import datetime
 from typing import Dict, List, Optional
 import logging
 
+# Robust MediaPipe import
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    class MockMP:
+        class solutions:
+            pose = None
+            face_detection = None
+    mp = MockMP()
+
 logger = logging.getLogger(__name__)
 
 class HealthStateDetector:
     def __init__(self):
-        self.pose = mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5
-        )
-        self.face_detection = mp.solutions.face_detection.FaceDetection(
-            min_detection_confidence=0.5
-        )
+        # MediaPipe solutions can be tricky on Windows depending on the version
+        # Some versions need mp.solutions, others need mediapipe.python.solutions
+        pose_module = None
+        face_module = None
+        
+        try:
+            pose_module = mp.solutions.pose
+            face_module = mp.solutions.face_detection
+        except Exception:
+            try:
+                # Direct imports as fallback
+                import mediapipe.python.solutions.pose as p
+                import mediapipe.python.solutions.face_detection as f
+                pose_module = p
+                face_module = f
+            except Exception:
+                # Final attempt: direct submodule access
+                try:
+                    from mediapipe.solutions import pose as p
+                    from mediapipe.solutions import face_detection as f
+                    pose_module = p
+                    face_module = f
+                except Exception as e:
+                    logger.error(f"Failed to load MediaPipe solutions: {e}")
+                    # If everything fails, it will raise AttributeError later
+
+        if MEDIAPIPE_AVAILABLE and pose_module and face_module:
+            try:
+                self.pose = pose_module.Pose(
+                    static_image_mode=False,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    min_detection_confidence=0.5
+                )
+                self.face_detection = face_module.FaceDetection(
+                    min_detection_confidence=0.5
+                )
+            except Exception as e:
+                logger.error(f"Error initializing MediaPipe components: {e}")
+                self.pose = None
+                self.face_detection = None
+        else:
+             logger.error("MediaPipe modules could not be loaded!")
+             self.pose = None
+             self.face_detection = None
         self.state_history = {}  # User ID → state timeline
         
         # Thresholds
@@ -89,6 +136,9 @@ class HealthStateDetector:
 
     def _detect_pose(self, image: np.ndarray) -> Dict:
         # Convert BGR to RGB
+        if not self.pose:
+            return {'detected': False, 'body_angle': 90, 'head_angle': 0}
+            
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         results = self.pose.process(image_rgb)
         
@@ -128,6 +178,9 @@ class HealthStateDetector:
         }
 
     def _detect_face(self, image: np.ndarray) -> Dict:
+         if not self.face_detection:
+             return {'detected': False}
+             
          image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
          results = self.face_detection.process(image_rgb)
          return {'detected': bool(results.detections)}
