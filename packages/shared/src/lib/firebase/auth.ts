@@ -26,19 +26,50 @@ import {
 import { auth, db } from './config';
 export { auth, db };
 import { ElderUser, FamilyUser } from '../../types/user';
+import { localUserStore } from './localUserStore';
+export { localUserStore };
+
+// --- Firestore helper: try Firestore, fall back to localStorage ---
+
+const saveUserToFirestoreOrLocal = async (uid: string, userData: any): Promise<void> => {
+    try {
+        await setDoc(doc(db, 'users', uid), userData);
+        console.log('✅ User saved to Firestore');
+    } catch (e: any) {
+        console.warn('⚠️ Firestore unavailable, saving to localStorage instead:', e?.code || e?.message);
+    }
+    // Always save to localStorage as backup
+    localUserStore.save({
+        ...userData,
+        uid,
+        createdAt: userData.createdAt?.toDate?.() ? userData.createdAt.toDate().toISOString() : new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+    });
+};
+
+const getUserData = async (uid: string): Promise<any | null> => {
+    try {
+        const userDocRef = doc(db, 'users', uid);
+        const userDoc = await getDoc(userDocRef);
+        if (userDoc.exists()) {
+            const data = userDoc.data();
+            // Also update localStorage cache
+            localUserStore.save({ ...data, uid } as any);
+            return data;
+        }
+    } catch (e: any) {
+        console.warn('⚠️ Firestore unavailable, reading from localStorage:', e?.code || e?.message);
+    }
+    // Fall back to localStorage
+    return localUserStore.get(uid);
+};
 
 // --- Auth Utilities ---
 
 export const mapFirebaseUserToUser = async (firebaseUser: User | null): Promise<ElderUser | FamilyUser | null> => {
     if (!firebaseUser) return null;
-
-    const userDocRef = doc(db, 'users', firebaseUser.uid);
-    const userDoc = await getDoc(userDocRef);
-
-    if (userDoc.exists()) {
-        return userDoc.data() as ElderUser | FamilyUser;
-    }
-    return null;
+    const data = await getUserData(firebaseUser.uid);
+    return data as ElderUser | FamilyUser | null;
 };
 
 // --- Sign Up ---
@@ -52,32 +83,27 @@ export const signUpElder = async (data: any) => {
 
         await updateProfile(user, { displayName: fullName });
 
-        // Generate own connection code for others to join (simple random for now)
         const myConnectionCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-        // Calculate age from dateOfBirth
         const birthDate = new Date(dateOfBirth);
         const today = new Date();
         const age = today.getFullYear() - birthDate.getFullYear();
 
-        const elderData: Omit<ElderUser, 'createdAt' | 'lastActive' | 'uid'> = {
+        const elderData = {
+            uid: user.uid,
             email,
             fullName,
             age,
             emergencyContact,
             familyMembers: [],
-            connectionCode: myConnectionCode, // Their own code
+            connectionCode: myConnectionCode,
             profileSetupComplete: false,
-            role: 'elder'
-        };
-
-        await setDoc(doc(db, 'users', user.uid), {
-            ...elderData,
-            uid: user.uid,
+            role: 'elder' as const,
             createdAt: serverTimestamp(),
             lastActive: serverTimestamp(),
-        });
+        };
 
+        await saveUserToFirestoreOrLocal(user.uid, elderData);
         return user;
     } catch (error: any) {
         throw new Error(getFriendlyErrorMessage(error));
@@ -95,11 +121,10 @@ export const signUpFamily = async (data: any) => {
 
         let eldersConnected: string[] = [];
 
-        // Link Elder Logic
+        // Link Elder Logic (best-effort)
         if (connectionCode) {
             try {
                 const usersRef = collection(db, 'users');
-                // Query for an elder with this connection code
                 const q = query(usersRef, where("connectionCode", "==", connectionCode), where("role", "==", "elder"));
                 const querySnapshot = await getDocs(q);
 
@@ -108,36 +133,32 @@ export const signUpFamily = async (data: any) => {
                     const elderId = elderDoc.id;
                     eldersConnected.push(elderId);
 
-                    // Update the Elder's doc to include this family member
                     await updateDoc(doc(db, 'users', elderId), {
                         familyMembers: arrayUnion(user.uid)
                     });
                 }
             } catch (e) {
-                console.error("Failed to link elder during signup", e);
+                console.warn("⚠️ Failed to link elder during signup (Firestore may be unavailable):", e);
             }
         }
 
-    const familyData: Omit<FamilyUser, 'createdAt' | 'lastLogin' | 'uid'> = {
-        email,
-        fullName,
-        phone: phone || null,  // Firestore does not accept undefined
-        relationship: relationship || 'family',
-        eldersConnected: eldersConnected, 
-        role: 'family'
-    };
+        const familyData = {
+            uid: user.uid,
+            email,
+            fullName,
+            phone: phone || null,
+            relationship: relationship || 'family',
+            eldersConnected: eldersConnected,
+            role: 'family' as const,
+            createdAt: serverTimestamp(),
+            lastLogin: serverTimestamp(),
+        };
 
-    await setDoc(doc(db, 'users', user.uid), {
-        ...familyData,
-        uid: user.uid,
-        createdAt: serverTimestamp(),
-        lastLogin: serverTimestamp(),
-    });
-
-    return user;
-} catch (error: any) {
-    throw new Error(getFriendlyErrorMessage(error));
-}
+        await saveUserToFirestoreOrLocal(user.uid, familyData);
+        return user;
+    } catch (error: any) {
+        throw new Error(getFriendlyErrorMessage(error));
+    }
 };
 
 // --- Sign In ---
@@ -145,71 +166,130 @@ export const signUpFamily = async (data: any) => {
 export const signInWithEmail = async (email: string, password: string) => {
     try {
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        const newCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-        // Update last login
-        const userDocRef = doc(db, 'users', userCredential.user.uid);
+        // Update profile in Firestore (best-effort)
         try {
-            await updateDoc(userDocRef, {
-                lastActive: serverTimestamp() // or lastLogin depending on role, using generic 'lastActive' for simplicity or check role
-            });
+            const userDocRef = doc(db, 'users', user.uid);
+            const snap = await getDoc(userDocRef);
+            if (snap.exists()) {
+                const data = snap.data();
+                const isElder = data.role === 'elder';
+                
+                const updates: any = { lastActive: serverTimestamp() };
+                if (isElder) updates.connectionCode = newCode;
+                
+                await updateDoc(userDocRef, updates);
+                
+                // Cache updated data
+                localUserStore.save({ ...data, ...updates, uid: user.uid });
+            }
         } catch (e) {
-            // If doc doesn't exist (legacy/error?), ignore or handle
-            console.error("Error updating last login", e);
+            console.warn("⚠️ Could not update session in Firestore:", e);
         }
+        
+        // Finalize local storage update
+        localUserStore.update({ lastActive: new Date().toISOString() });
 
-        return userCredential.user;
-} catch (error: any) {
-    throw new Error(getFriendlyErrorMessage(error));
-}
+        return user;
+    } catch (error: any) {
+        throw new Error(getFriendlyErrorMessage(error));
+    }
 };
 
 // --- Helper: Setup or update Google user document ---
 
 const setupOrUpdateGoogleUser = async (user: User, role: 'elder' | 'family') => {
-    const userDocRef = doc(db, 'users', user.uid);
-    const userDoc = await getDoc(userDocRef);
+    const now = new Date().toISOString();
+    const newCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-    if (!userDoc.exists()) {
-        const baseData = {
+    if (role === 'elder') {
+        const elderData = {
             uid: user.uid,
             email: user.email || '',
             fullName: user.displayName || '',
-            createdAt: serverTimestamp(),
-            lastActive: serverTimestamp(),
-            role: role
+            age: 0,
+            emergencyContact: '',
+            familyMembers: [],
+            connectionCode: newCode,
+            profileSetupComplete: false,
+            role: 'elder' as const,
+            createdAt: now,
+            lastActive: now,
         };
 
-        if (role === 'elder') {
-            await setDoc(userDocRef, {
-                ...baseData,
-                age: 0,
-                emergencyContact: '',
-                familyMembers: [],
-                connectionCode: Math.floor(100000 + Math.random() * 900000).toString(),
-                profileSetupComplete: false
-            });
-        } else {
-            await setDoc(userDocRef, {
-                ...baseData,
-                phone: '',
-                relationship: 'other',
-                eldersConnected: []
-            });
+        // Try Firestore first
+        try {
+            const userDocRef = doc(db, 'users', user.uid);
+            const userDoc = await getDoc(userDocRef);
+
+            if (!userDoc.exists()) {
+                await setDoc(userDocRef, {
+                    ...elderData,
+                    createdAt: serverTimestamp(),
+                    lastActive: serverTimestamp(),
+                });
+            } else {
+                // Update existing user with new code and lastActive
+                await updateDoc(userDocRef, { 
+                    lastActive: serverTimestamp(),
+                    connectionCode: newCode 
+                });
+                // Update localStorage with merged data
+                localUserStore.save({ ...userDoc.data(), ...elderData, uid: user.uid } as any);
+                return;
+            }
+        } catch (e: any) {
+            console.warn('⚠️ Firestore unavailable for Google user setup:', e?.code || e?.message);
         }
+
+        // Always save to localStorage
+        localUserStore.save(elderData);
     } else {
-        await updateDoc(userDocRef, {
-            lastActive: serverTimestamp()
-        });
+        const familyData = {
+            uid: user.uid,
+            email: user.email || '',
+            fullName: user.displayName || '',
+            phone: '',
+            relationship: 'other',
+            eldersConnected: [],
+            role: 'family' as const,
+            createdAt: now,
+            lastActive: now,
+        };
+
+        try {
+            const userDocRef = doc(db, 'users', user.uid);
+            const userDoc = await getDoc(userDocRef);
+
+            if (!userDoc.exists()) {
+                await setDoc(userDocRef, {
+                    ...familyData,
+                    createdAt: serverTimestamp(),
+                    lastActive: serverTimestamp(),
+                });
+            } else {
+                await updateDoc(userDocRef, { lastActive: serverTimestamp() });
+                localUserStore.save({ ...userDoc.data(), uid: user.uid } as any);
+                return;
+            }
+        } catch (e: any) {
+            console.warn('⚠️ Firestore unavailable for Google user setup:', e?.code || e?.message);
+        }
+
+        localUserStore.save(familyData);
     }
+
+    console.log('✅ Google user setup completed for:', user.email);
 };
 
-// --- Sign In with Google (Redirect-based for reliability) ---
+// --- Sign In with Google ---
 
 export const signInWithGoogle = async (role: 'elder' | 'family') => {
     try {
         const provider = new GoogleAuthProvider();
 
-        // Store the role in sessionStorage so we can retrieve it after redirect
         sessionStorage.setItem('google_signin_role', role);
         sessionStorage.setItem('google_signin_pending', 'true');
 
@@ -223,7 +303,6 @@ export const signInWithGoogle = async (role: 'elder' | 'family') => {
         } catch (popupError: any) {
             console.warn('⚠️ Popup sign-in failed, falling back to redirect...', popupError?.code);
 
-            // If popup fails due to network/blocked/closed issues, fall back to redirect
             const fallbackCodes = [
                 'auth/network-request-failed',
                 'auth/popup-blocked',
@@ -233,13 +312,10 @@ export const signInWithGoogle = async (role: 'elder' | 'family') => {
             ];
 
             if (fallbackCodes.includes(popupError?.code)) {
-                // Redirect-based sign-in: the page will navigate away and come back
                 await signInWithRedirect(auth, provider);
-                // This line won't be reached — the browser redirects away
                 return null as any;
             }
 
-            // For other errors (invalid API key, operation not allowed, etc.), throw immediately
             throw popupError;
         }
     } catch (error: any) {
@@ -266,7 +342,6 @@ export const processGoogleRedirectResult = async (): Promise<User | null> => {
             return result.user;
         }
 
-        // No result but was pending — user may have cancelled or it failed
         sessionStorage.removeItem('google_signin_pending');
         return null;
     } catch (error: any) {
@@ -277,34 +352,37 @@ export const processGoogleRedirectResult = async (): Promise<User | null> => {
     }
 };
 
+// --- Error Messages ---
+
 const getFriendlyErrorMessage = (error: any): string => {
     console.error('🔥 [FRONTEND_AUTH_ERROR]:', error);
     
-    // Check if it's a network error
     if (error?.message?.toLowerCase().includes('failed to fetch')) {
-        return "Network Error: Cannot reach Auth Service. Please check if your backend is running. (NetworkError)";
+        return "Network Error: Cannot reach Auth Service. Please check if your backend is running.";
     }
 
     const errorCode = error?.code || 'unknown';
 
     switch (errorCode) {
         case 'auth/network-request-failed':
-            return "Network error: Could not connect to Google. Retrying with redirect... If this persists, check your internet connection and disable any VPN or firewall. (auth/network-request-failed)";
+            return "Network error: Could not connect to Google. Retrying with redirect...";
         case 'auth/unauthorized-domain':
-            return `Unauthorized Domain: Please add 'localhost' to Authorized Domains in Firebase Console. (${errorCode})`;
+            return `Unauthorized Domain: Please add 'localhost' to Authorized Domains in Firebase Console.`;
         case 'auth/popup-blocked':
-            return "Login popup blocked! Retrying with redirect... (auth/popup-blocked)";
+            return "Login popup blocked! Retrying with redirect...";
         case 'auth/popup-closed-by-user':
-            return "Login cancelled. Please try again. (auth/popup-closed-by-user)";
+            return "Login cancelled. Please try again.";
         case 'auth/operation-not-allowed':
-            return "Google Sign-In is NOT enabled in your Firebase Console. Go to Authentication > Sign-in method > Google and enable it. (auth/operation-not-allowed)";
+            return "Google Sign-In is NOT enabled in your Firebase Console. Go to Authentication > Sign-in method > Google and enable it.";
         case 'auth/user-not-found':
         case 'auth/wrong-password':
             return "Invalid email or password.";
         case 'auth/email-already-in-use':
             return "This email is already registered.";
         case 'auth/invalid-api-key':
-            return "Invalid Firebase API Key in .env. (auth/invalid-api-key)";
+            return "Invalid Firebase API Key in .env.";
+        case 'unavailable':
+            return "Database temporarily unavailable. You're signed in but some features may be limited.";
         default:
             return `An unexpected error occurred: ${errorCode}. Please check the console for details.`;
     }
@@ -314,6 +392,7 @@ const getFriendlyErrorMessage = (error: any): string => {
 
 export const signOut = async () => {
     localStorage.removeItem('dev_bypass_auth');
+    localUserStore.remove();
     sessionStorage.removeItem('google_signin_pending');
     sessionStorage.removeItem('google_signin_role');
     await firebaseSignOut(auth);
