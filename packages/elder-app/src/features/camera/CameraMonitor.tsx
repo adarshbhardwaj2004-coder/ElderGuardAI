@@ -10,9 +10,8 @@ import {
 import { useVisionAnalysis } from "@/hooks/useVisionAnalysis";
 import { AIInsightsPanel } from "./AIInsightsPanel";
 import { auth, db, type ElderUser, type FamilyMemberManual } from "@elder-nest/shared";
-import { doc, onSnapshot, updateDoc, arrayUnion, Timestamp } from "firebase/firestore";
+import { doc, onSnapshot, updateDoc, arrayUnion, Timestamp, addDoc, collection, serverTimestamp, getDoc } from "firebase/firestore";
 import { ShieldCheck, ShieldAlert, UserCheck, ScanFace } from "lucide-react";
-
 
 export const CameraMonitor: React.FC = () => {
     const videoRef = useRef<HTMLVideoElement>(null);
@@ -31,6 +30,9 @@ export const CameraMonitor: React.FC = () => {
     const [securityStatus, setSecurityStatus] = useState<'secure' | 'scanning' | 'alert'>('secure');
     const [detectedPerson, setDetectedPerson] = useState<{ name: string; relation: string; photo?: string } | null>(null);
     const [knownFaces, setKnownFaces] = useState<FamilyMemberManual[]>([]);
+    
+    // To prevent spamming fall alerts, remember when we last alerted
+    const lastFallAlertRef = useRef<number>(0);
 
     const { analyzeFrame, analyzing, lastResult } = useVisionAnalysis();
 
@@ -117,9 +119,50 @@ export const CameraMonitor: React.FC = () => {
             context.drawImage(video, 0, 0, canvas.width, canvas.height);
 
             const imageBase64 = canvas.toDataURL('image/jpeg', 0.6); // Compress slightly
-            await analyzeFrame(imageBase64);
+            const visionResult = await analyzeFrame(imageBase64);
+            
+            // Check for critical alerts (e.g. falls) from the backend
+            if (visionResult?.fall?.fall_detected && auth.currentUser) {
+                const now = Date.now();
+                // Send an alert at most once every 60 seconds to avoid spamming
+                if (now - lastFallAlertRef.current > 60000) {
+                    lastFallAlertRef.current = now;
+                    triggerEmergencyAlert("FALL DETECTED");
+                }
+            }
         }
     }, [isActive, analyzing, analyzeFrame]);
+
+    const triggerEmergencyAlert = async (type: string) => {
+        const user = auth.currentUser;
+        if (!user) return;
+        
+        try {
+            console.error(`🚨 EMERGENCY TRIGGERED: ${type} 🚨`);
+            const elderDoc = await getDoc(doc(db, 'users', user.uid));
+            const elderData = elderDoc.data();
+            const familyIds = elderData?.familyMembers || [];
+
+            await addDoc(collection(db, 'alerts'), {
+                elderId: user.uid,
+                type: 'fall',
+                severity: 'critical',
+                message: `URGENT: Fall detected by AI Camera for ${user.displayName || 'Elder'}!`,
+                timestamp: serverTimestamp(),
+                acknowledged: false,
+                familyIds: familyIds
+            });
+
+            // Set emergency mode in elder user document
+            const userRef = doc(db, 'users', user.uid);
+            await updateDoc(userRef, {
+                isEmergency: true,
+                lastActive: serverTimestamp()
+            });
+        } catch (e) {
+            console.error("Failed to trigger fall emergency alert", e);
+        }
+    };
 
     // Frame processing loop (MOOD MODE)
     useEffect(() => {
